@@ -16,11 +16,19 @@ log = get_logger()
 
 @dataclass
 class AutomataFormula:
-    formula: ExprRef
+    formula: list[ExprRef]
+    formula_names: list[str]
     col_vars: dict[tuple[tuple, int], BoolRef]
     par_vars: dict[tuple[str, int, int], BoolRef]
     acpt_vars: dict[int, BoolRef]
     alphabet: set[str]
+
+    def create_solver(self) -> Solver:
+        solver = Solver()
+        solver.set(unsat_core=True)
+        for f, n in zip(self.formula, self.formula_names):
+            solver.assert_and_track(f, n)
+        return solver
 
 
 def _words_from_node(node: MooreNode, alphabet: set[str]) -> set[tuple[str]]:
@@ -116,10 +124,12 @@ class DCObservationTree(ObservationTree):
             acpt_vars[c] = Bool(f"a_{c}")
 
         formula = []
+        formula_names = []
 
         # 0: Set basis states to set colors
         for i, b in enumerate(basis):
             formula.append(col_vars[(b, i)])
+            formula_names.append(f"basis_{b}_color_{i}")
 
         # 1,2: Set color to accepting or rejecting
         for w in words:
@@ -134,6 +144,7 @@ class DCObservationTree(ObservationTree):
                 else:
                     a_r = Not(acpt_vars[c])
                 formula.append(Implies(col_vars[(w, c)], a_r))
+                formula_names.append(f"state_{w}_color_{c}_is_accepting_{a_r}")
 
         # 3: Each word has at least one color
         for w in words:
@@ -141,6 +152,7 @@ class DCObservationTree(ObservationTree):
             for c in range(n_colors):
                 disj.append(col_vars[(w, c)])
             formula.append(Or(disj))
+            formula_names.append(f"state_{w}_has_color")
 
         # 4: when a state and its parent are colored the transition is set
         for c_src in range(n_colors):
@@ -152,6 +164,9 @@ class DCObservationTree(ObservationTree):
                                 And(col_vars[(w[:-1], c_src)], col_vars[(w, c_dst)]),
                                 par_vars[w[-1], c_src, c_dst],
                             )
+                        )
+                        formula_names.append(
+                            f"state_{w}_color_{c_dst}_and_parent_color_{c_src}_implies_transition_{w[-1]}_{c_src}_{c_dst}"
                         )
 
         # 5: Each transition can only target one state
@@ -165,6 +180,9 @@ class DCObservationTree(ObservationTree):
                                 Not(par_vars[(l, c_src, c_dst_other)]),
                             )
                         )
+                        formula_names.append(
+                            f"transition_{l}_{c_src}_to_{c_dst}_and_{c_dst_other}_mutually_exclusive"
+                        )
 
         # 6: Each state has at most one color
         for w in words:
@@ -172,6 +190,9 @@ class DCObservationTree(ObservationTree):
                 for c_prime in range(c + 1, n_colors):
                     formula.append(
                         Or(Not(col_vars[(w, c)]), Not(col_vars[(w, c_prime)]))
+                    )
+                    formula_names.append(
+                        f"state_{w}_color_{c}_and_{c_prime}_mutually_exclusive"
                     )
 
         # 7: Each transition must target at least one state
@@ -181,6 +202,7 @@ class DCObservationTree(ObservationTree):
                 for c_dst in range(n_colors):
                     disj.append(par_vars[(l, c_src, c_dst)])
                 formula.append(Or(disj))
+                formula_names.append(f"transition_{l}_{c_src}_has_target")
 
         # 8: State color is set when transition and parent color are set
         for w in words:
@@ -198,6 +220,9 @@ class DCObservationTree(ObservationTree):
                             col_vars[(w, c_dst)],
                         )
                     )
+                    formula_names.append(
+                        f"state_{w}_color_{c_dst}_is_set_by_parent_color_{c_src}_and_transition_{w[-1]}_{c_src}_{c_dst}"
+                    )
 
         # 9: Two apart states must be different
         for c in range(n_colors):
@@ -210,9 +235,12 @@ class DCObservationTree(ObservationTree):
                     s_v = self.get_successor(v)
                     if Apartness.states_are_apart(s_w, s_v, self):
                         formula.append(Implies(col_vars[(w, c)], Not(col_vars[(v, c)])))
+                        formula_names.append(
+                            f"states_{w}_and_{v}_are_apart_cannot_share_color_{c}"
+                        )
 
         return AutomataFormula(
-            And(formula), col_vars, par_vars, acpt_vars, self.alphabet
+            formula, formula_names, col_vars, par_vars, acpt_vars, self.alphabet
         )
 
     def _find_basis_states_in_hypothesis(self, hypothesis: Dfa):
@@ -256,9 +284,29 @@ class DCObservationTree(ObservationTree):
 
         self.insert_observation(inputs, outputs)
         self.update_basis_candidates(frontier_state)
-        if len(self.frontier_to_basis_dict.get(frontier_state)) == old_candidate_size:
+        if (
+            len(self.frontier_to_basis_dict.get(frontier_state)) == old_candidate_size
+            and len(self.frontier_to_basis_dict[frontier_state]) > 1
+        ):
             # Because of DCs we should not raise an exception here anymore
             log.debug(f"Identification did not help for {frontier_state.id}")
+            new_info = False
+            for inp in self.alphabet:
+                if frontier_state.get_successor(inp) is None:
+                    new_info = True
+                    inputs = self.get_transfer_sequence(self.root, frontier_state) + [
+                        inp
+                    ]
+                    outputs = self.sul.query(inputs)
+                    self.insert_observation(inputs, outputs)
+
+            if not new_info:
+                log.warning(
+                    f"Identification did not help for {frontier_state.id}, and no new information could be added."
+                )
+            else:
+                log.info(f"Retrying identification for {frontier_state.id}")
+                self.identify_frontier(frontier_state)
 
     @override
     def construct_hypothesis(self):
@@ -270,8 +318,7 @@ class DCObservationTree(ObservationTree):
         old_extra_states = extra_states
 
         formula = self._build_z3_formula(extra_states)
-        solver = Solver()
-        solver.add(formula.formula)
+        solver = formula.create_solver()
 
         hypotheses = []
 
@@ -286,8 +333,7 @@ class DCObservationTree(ObservationTree):
             if old_extra_states != extra_states:
                 formula = self._build_z3_formula(extra_states)
                 old_extra_states = extra_states
-                solver = Solver()
-                solver.add(formula.formula)
+                solver = formula.create_solver()
 
             log.info("Solving...")
             # log.debug(f"Solving {solver.sexpr()}")
