@@ -1,13 +1,4 @@
-# Visualization of an ObservationTree (raw tree, not hypothesis) by converting every
-# tree node into a temporary automaton and delegating to Automaton.visualize.
-# Compact styling encoding used in state_id:
-#   <num>~<color>%<pattern>
-# Where pattern in {solid,checker,lines}. Color or pattern may be omitted (defaults: white/solid).
-# Moore states keep the suffix '|output' (handled by FileHandler). Labels show only the numeric id (and output for Moore).
-# Basis -> unique color solid; frontier single-candidate -> lines pattern with candidate color; frontier multi -> checker.
-# Internal nodes -> white solid.
 from __future__ import annotations
-from typing import List, Dict
 
 from aalpy.learning_algs.deterministic.ObservationTree import (
     ObservationTree,
@@ -22,14 +13,11 @@ from aalpy.automata import (
     MooreMachine,
     MooreState,
 )
-from lsharpsat.DCValue import DCValue
 
-_BASIS_COLORS = [
-    str(c) for c in range(1,13)
-]
+_BASIS_COLORS = [str(c) for c in range(1, 13)]
 
 
-def _collect_tree_nodes(root) -> List:  # BFS collection of all nodes
+def _collect_tree_nodes(root) -> list:  # BFS collection of all nodes
     visited = []
     queue = [root]
     seen = set()
@@ -42,13 +30,14 @@ def _collect_tree_nodes(root) -> List:  # BFS collection of all nodes
         if isinstance(n, MealyNode):
             for _, (_, succ) in n.successors.items():
                 queue.append(succ)
-        else:  # MooreNode
+        else:
+            assert isinstance(n, MooreNode)
             for _, succ in n.successors.items():
                 queue.append(succ)
     return visited
 
 
-def _assign_basis_colors(basis_nodes: List) -> Dict:
+def _assign_basis_colors(basis_nodes: list) -> dict:
     mapping = {}
     for i, b in enumerate(basis_nodes):
         mapping[b] = _BASIS_COLORS[i % len(_BASIS_COLORS)]

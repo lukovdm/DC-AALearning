@@ -307,6 +307,7 @@ class DCObservationTree(ObservationTree):
                 log.info(f"sat, found dfa {len(hypotheses)}")
                 solver.add(not_model(m, formula))
                 hypotheses.append(hypothesis)
+                return hypotheses[-1]
             else:
                 log.info("unsat")
                 c = solver.unsat_core()
