@@ -1,0 +1,29 @@
+[project]
+name = "lsharpsat"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Luko van der Maas",email = "luko.vandermaas@ru.nl"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "aalpy @ file:///home/luko/Documents/AALpy",
+    "z3-solver (>=4.15.1.0,<5.0.0.0)",
+    "z3 (>=0.2.0,<0.3.0)",
+]
+package-mode = false
+
+[tool.poetry]
+
+[tool.poetry.group.dev.dependencies]
+black = "^25.1.0"
+py-spy = "^0.4.0"
+memray = "^1.17.2"
+
+[tool.poetry.dependencies]
+aalpy = {develop = true}
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
