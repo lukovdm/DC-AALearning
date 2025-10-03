@@ -1,3 +1,4 @@
+from collections import deque
 from copy import copy
 from dataclasses import dataclass
 
@@ -6,8 +7,13 @@ from z3 import BoolRef, ModelRef, Not, Implies, Or, And, Bool, Solver, sat, Expr
 
 from aalpy import Dfa, DfaState
 from aalpy.learning_algs.deterministic.Apartness import Apartness
-from aalpy.learning_algs.deterministic.ObservationTree import ObservationTree, MooreNode
+from aalpy.learning_algs.deterministic.ObservationTree import (
+    ObservationTree,
+    MooreNode,
+    MealyNode,
+)
 from lsharpsat.DCApartness import DCApartness
+from lsharpsat.DCValue import common_dc_value
 from lsharpsat.ObsTreeVisualizer import visualize_observation_tree
 from lsharpsat.logger import get_logger
 
@@ -29,6 +35,19 @@ class AutomataFormula:
         for f, n in zip(self.formula, self.formula_names):
             solver.assert_and_track(f, n)
         return solver
+
+
+def dfa_paths_to_state(dfa: Dfa, state: DfaState):
+    """Generator of all paths from from_state to state in dfa, BFS"""
+    queue = [([], dfa.initial_state)]
+
+    while queue:
+        path, current_state = queue.pop(0)
+        if current_state == state:
+            yield path
+
+        for input_val, next_state in current_state.transitions.items():
+            queue.append((path + [input_val], next_state))
 
 
 def _words_from_node(node: MooreNode, alphabet: set[str]) -> set[tuple[str]]:
@@ -99,6 +118,10 @@ def build_dfa_from_model(formula: AutomataFormula, model: ModelRef) -> Dfa[str]:
 class DCObservationTree(ObservationTree):
     apartness = DCApartness
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_hyp_size = 0
+
     def _words(self) -> list[tuple[str]]:
         return sorted(_words_from_node(self.root, self.alphabet))
 
@@ -106,7 +129,7 @@ class DCObservationTree(ObservationTree):
         n_colors = len(self.basis) + extra_states
         words = self._words()
         basis = [word_of_node(b) for b in self.basis]
-        log.info(f"{words}")
+        # log.info(f"{words}")
 
         col_vars = {}
         for w in words:
@@ -126,10 +149,19 @@ class DCObservationTree(ObservationTree):
         formula = []
         formula_names = []
 
-        # 0: Set basis states to set colors
+        # 0a: Set basis states to set colors
         for i, b in enumerate(basis):
             formula.append(col_vars[(b, i)])
             formula_names.append(f"basis_{b}_color_{i}")
+
+        # 0b: Set identified frontier states to basis color
+        # for f, bs in self.frontier_to_basis_dict.items():
+        #     if len(bs) == 1:
+        #         b = bs[0]
+        #         i = basis.index(word_of_node(b))
+        #         w = word_of_node(f)
+        #         formula.append(col_vars[(w, i)])
+        #         formula_names.append(f"frontier_{w}_to_basis_{b}_({i})")
 
         # 1,2: Set color to accepting or rejecting
         for w in words:
@@ -252,6 +284,14 @@ class DCObservationTree(ObservationTree):
                 hypothesis.step(l)
             self.states_dict[b] = hypothesis.current_state
 
+        for s in hypothesis.states:
+            if s not in self.states_dict.values():
+                for path in dfa_paths_to_state(hypothesis, s):
+                    tree_node = self.get_successor(path)
+                    if tree_node is not None:
+                        self.states_dict[tree_node] = s
+                        break
+
     @override
     def make_observation_tree_adequate(self):
         self.update_frontier_and_basis()
@@ -264,6 +304,61 @@ class DCObservationTree(ObservationTree):
             self.make_basis_complete()
             self.make_frontiers_identified()
             self.promote_frontier_state()
+
+    def get_distinguishing_sequences(self, group: list[MooreNode | MealyNode]):
+        """
+        Get distinguishing sequences for a group of states.
+        :param group: list of states
+        :return: generator of distinguishing sequences
+        """
+        if self.automaton_type == "mealy":
+            return self._get_distinguishing_sequences_mealy(group)
+        else:
+            return self._get_distinguishing_sequences_moore(group)
+
+    def _get_distinguishing_sequences_mealy(self, group: list[MealyNode]):
+        # Identifies all distinguishing input-output pairs in the provided alphabet of the n states
+        groups = deque([([], group)])
+
+        while groups:
+            access_seq, group = groups.popleft()
+            for input_val in self.alphabet:
+                valid_group = [node for node in group if input_val in node.successors]
+
+                if len(valid_group) >= 2:
+                    outputs = [node.get_output(input_val) for node in valid_group]
+                    try:
+                        common_dc_value(*outputs)
+                    except ValueError:
+                        yield access_seq + [input_val]
+
+                    groups.append(
+                        (
+                            access_seq + [input_val],
+                            [node.get_successor(input_val) for node in valid_group],
+                        )
+                    )
+
+    def _get_distinguishing_sequences_moore(self, group: list[MooreNode]):
+        # Identifies if two states can be distinguished by any input-output pair in the provided alphabet
+        groups = deque([([], group)])
+
+        while groups:
+            access_seq, group = groups.popleft()
+            outputs = [node.output for node in group]
+            try:
+                common_dc_value(*outputs)
+            except ValueError:
+                yield access_seq
+
+            for input_val in self.alphabet:
+                successors = [
+                    s
+                    for s in [node.get_successor(input_val) for node in group]
+                    if s is not None
+                ]
+                if len(successors) >= 2:
+                    groups.append((access_seq + [input_val], successors))
 
     @override
     def identify_frontier(self, frontier_state):
@@ -278,11 +373,11 @@ class DCObservationTree(ObservationTree):
             return
 
         if self.separation_rule == "SepSeq" or old_candidate_size == 2:
-            inputs, outputs = self._identify_frontier_sepseq(frontier_state)
+            self._identify_frontier_sepseq(frontier_state)
         else:
             inputs, outputs = self._identify_frontier_ads(frontier_state)
+            self.insert_observation(inputs, outputs)
 
-        self.insert_observation(inputs, outputs)
         self.update_basis_candidates(frontier_state)
         if (
             len(self.frontier_to_basis_dict.get(frontier_state)) == old_candidate_size
@@ -309,16 +404,36 @@ class DCObservationTree(ObservationTree):
                 self.identify_frontier(frontier_state)
 
     @override
+    def _identify_frontier_sepseq(self, frontier_state):
+        # Specifically identify frontier states using separating sequences
+        basis_candidates = self.frontier_to_basis_dict.get(frontier_state)
+
+        witnesses = [
+            w
+            for w in self.get_distinguishing_sequences(basis_candidates)
+            if self.get_successor(w, from_node=frontier_state) is None
+        ]
+
+        if len(witnesses) == 0:
+            log.debug(
+                f"No possible witnesses found for {frontier_state.id} with basis {[b.id for b in basis_candidates]}"
+            )
+
+        for witness in witnesses:
+            inputs = self.get_transfer_sequence(self.root, frontier_state)
+            inputs.extend(witness)
+            outputs = self.sul.query(inputs)
+
+            self.insert_observation(inputs, outputs)
+
+    @override
     def construct_hypothesis(self):
         visualize_observation_tree(
             self, f"out/ob_tree_{len(self.basis)}_basis.png", file_type="png"
         )
 
-        extra_states = 0
-        old_extra_states = extra_states
-
-        formula = self._build_z3_formula(extra_states)
-        solver = formula.create_solver()
+        extra_states = max(0, self.last_hyp_size - len(self.basis))
+        old_extra_states = None
 
         hypotheses = []
 
@@ -326,7 +441,7 @@ class DCObservationTree(ObservationTree):
             log.debug(
                 f"Trying to build dfa with {len(self.basis) + extra_states} states"
             )
-            if len(self.basis) + extra_states > 5:
+            if len(self.basis) + extra_states > 6:
                 log.error("Something went wrong, could not find the dfa")
                 exit(1)
 
@@ -353,7 +468,8 @@ class DCObservationTree(ObservationTree):
                 log.info(f"sat, found dfa {len(hypotheses)}")
                 solver.add(not_model(m, formula))
                 hypotheses.append(hypothesis)
-                return hypotheses[-1]
+                self.last_hyp_size = len(hypothesis.states)
+                return hypothesis
             else:
                 log.info("unsat")
                 c = solver.unsat_core()
@@ -414,65 +530,127 @@ class DCObservationTree(ObservationTree):
                         outputs.append(current_node.output)
             return outputs
 
-    def insert_observation_sequence(self, inputs, outputs):
-        """
-        Insert an observation into the tree using sequences of inputs and their corresponding outputs.
-        :param inputs: List of inputs
-        :param outputs: Outputs corresponding to the input sequence
-        """
-        if len(inputs) != len(outputs):
-            raise ValueError("Inputs and outputs must have the same length.")
-
-        current_node = self.root
-        for input_val, output_val in zip(inputs, outputs):
-            current_node = current_node.extend_and_get(input_val, output_val)
-            current_node.output = output_val
+    # @override
+    # def _process_binary_search(self, hypothesis, cex_inputs, cex_outputs):
+    #     """
+    #     use LINEAR search on the counter example to compute a witness between the real system and the hypothesis
+    #     override the binary search from the parent class
+    #     """
+    #     visualize_observation_tree(
+    #         self, f"out/ob_tree_{len(self.basis)}_ce.png", file_type="png"
+    #     )
+    #
+    #     nodes_dict = {}
+    #     for hyp_node, hyp_state in self.states_dict.items():
+    #         nodes_dict[hyp_state] = hyp_node
+    #
+    #     access_seq = cex_inputs
+    #     tree_node = self.get_successor(cex_inputs)
+    #     witness_seq = []
+    #     while not (tree_node in self.frontier_to_basis_dict or tree_node in self.basis):
+    #         witness_seq = [access_seq[-1]] + witness_seq
+    #         access_seq = access_seq[:-1]
+    #
+    #         tree_node = tree_node.parent
+    #         hyp_state = self._get_automaton_successor(
+    #             hypothesis, hypothesis.initial_state, access_seq
+    #         )
+    #         hyp_node = nodes_dict[hyp_state]
+    #         hyp_access = self.get_transfer_sequence(self.root, hyp_node)
+    #
+    #         hyp_output = self._get_automaton_successor(
+    #             hypothesis, hyp_state, witness_seq
+    #         ).output
+    #
+    #         witness_node = self.get_successor(witness_seq, from_node=hyp_node)
+    #         if witness_node is None or witness_node.output is None:
+    #             output_seq = self.sul.query(hyp_access + witness_seq)
+    #             self.insert_observation(hyp_access + witness_seq, output_seq)
+    #             witness_node = self.get_successor(witness_seq, from_node=hyp_node)
+    #             visualize_observation_tree(
+    #                 self, f"out/ob_tree_{len(self.basis)}_ce.png", file_type="png"
+    #             )
+    #         else:
+    #             # No new information will be inserted, since node is already explored.
+    #             # Either the node is consistent with hypothesis,
+    #             # or it has been inserted during the counter example processing.
+    #             # To prevent looping we ignore it.
+    #             continue
+    #
+    #         tree_output = witness_node.output
+    #
+    #         if hyp_output != tree_output:
+    #             access_seq = hyp_access + witness_seq
+    #             tree_node = self.get_successor(access_seq)
+    #             witness_seq = []
 
     @override
     def _process_binary_search(self, hypothesis, cex_inputs, cex_outputs):
         """
-        use LINEAR search on the counter example to compute a witness between the real system and the hypothesis
-        override the binary search from the parent class
+        use binary search on the counter example to compute a witness between the real system and the hypothesis
         """
-        nodes_dict = {}
-        for hyp_node, hyp_state in self.states_dict.items():
-            nodes_dict[hyp_state] = hyp_node
-
-        access_seq = cex_inputs
+        visualize_observation_tree(
+            self, f"out/ob_tree_{len(self.basis)}_ce.png", file_type="png"
+        )
         tree_node = self.get_successor(cex_inputs)
-        witness_seq = []
-        while not (tree_node in self.frontier_to_basis_dict or tree_node in self.basis):
-            witness_seq = [access_seq[-1]] + witness_seq
-            access_seq = access_seq[:-1]
+        self.update_frontier_and_basis()
 
-            tree_node = tree_node.parent
-            hyp_state = self._get_automaton_successor(
-                hypothesis, hypothesis.initial_state, access_seq
+        if tree_node in self.frontier_to_basis_dict or tree_node in self.basis:
+            return
+
+        hyp_state = self._get_automaton_successor(
+            hypothesis, hypothesis.initial_state, cex_inputs
+        )
+        hyp_node = list(self.states_dict.keys())[
+            list(self.states_dict.values()).index(hyp_state)
+        ]
+
+        prefix = []
+        current_state = self.root
+        for input in cex_inputs:
+            if current_state in self.frontier_to_basis_dict:
+                break
+            current_state = current_state.get_successor(input)
+            prefix.append(input)
+
+        h = (len(prefix) + len(cex_inputs)) // 2
+        sigma1 = list(cex_inputs[:h])
+        sigma2 = list(cex_inputs[h:])
+
+        hyp_state_p = self._get_automaton_successor(
+            hypothesis, hypothesis.initial_state, sigma1
+        )
+        hyp_node_p = list(self.states_dict.keys())[
+            list(self.states_dict.values()).index(hyp_state_p)
+        ]
+        hyp_p_access = self.get_transfer_sequence(self.root, hyp_node_p)
+
+        if not self.apartness.states_are_apart(tree_node, hyp_node, self):
+            witness = []
+        else:
+            witness = self.apartness.compute_witness(tree_node, hyp_node, self)
+            if witness is None:
+                raise RuntimeError("Binary search: There should be a witness")
+
+        query_inputs = hyp_p_access + sigma2 + witness
+        query_outputs = self.sul.query(query_inputs)
+
+        self.insert_observation(query_inputs, query_outputs)
+        visualize_observation_tree(
+            self, f"out/ob_tree_{len(self.basis)}_ce.png", file_type="png"
+        )
+
+        tree_node_p = self.get_successor(sigma1)
+
+        witness_p = self.apartness.compute_witness(tree_node_p, hyp_node_p, self)
+
+        if witness_p is not None:
+            self._process_binary_search(hypothesis, sigma1, cex_outputs[:h])
+        else:
+            new_inputs = list(hyp_p_access) + sigma2
+            print(
+                f"New inputs: {new_inputs}, outputs: {query_outputs[: len(new_inputs)]}"
             )
-            hyp_node = nodes_dict[hyp_state]
-            hyp_access = self.get_transfer_sequence(self.root, hyp_node)
-
-            hyp_output = self._get_automaton_successor(
-                hypothesis, hyp_state, witness_seq
-            ).output
-
-            witness_node = self.get_successor(witness_seq, from_node=hyp_node)
-            if witness_node is None or witness_node.output is None:
-                output_seq = self._get_output_sequence(
-                    hyp_access + witness_seq, query_mode="final"
-                )
-                self.insert_observation_sequence(hyp_access + witness_seq, output_seq)
-                witness_node = self.get_successor(witness_seq, from_node=hyp_node)
-            else:
-                # No new information will be inserted, since node is already explored.
-                # Either the node is consistent with hypothesis,
-                # or it has been inserted during the counter example processing.
-                # To prevent looping we ignore it.
-                continue
-
-            tree_output = witness_node.output
-
-            if hyp_output != tree_output:
-                access_seq = hyp_access + witness_seq
-                tree_node = self.get_successor(access_seq)
-                witness_seq = []
+            self._process_binary_search(
+                hypothesis, new_inputs, query_outputs[: len(new_inputs)]
+            )

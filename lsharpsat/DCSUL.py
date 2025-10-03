@@ -41,6 +41,7 @@ class RandomDCSUL(SUL):
     def post(self):
         self.sul.post()
 
+
 class OutputDCSUL(SUL):
     def __init__(self, sul: SUL, dc_output, output_map: dict):
         super().__init__()
@@ -52,10 +53,14 @@ class OutputDCSUL(SUL):
         self.dc_output = dc_output
         self.output_map = output_map
 
+        self.path = []
+
     def pre(self):
         self.sul.pre()
+        self.path = []
 
     def step(self, letter=None):
+        self.path.append(letter)
         out = self.sul.step(letter)
         if out == self.dc_output:
             return DCValue(None)
